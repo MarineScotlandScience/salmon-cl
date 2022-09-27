@@ -30,7 +30,7 @@ option_list = list(
                 pc1  - land usage principal component
                 lcpa - log catch per area
                 sf   - spring fish population
-                e.g.               "lat pc1" [default %default]'),
+                e.g.   lat pc1 [default %default]'),
   make_option(c("-s", "--spatial_position_smoother"), action="store_true", 
               default=FALSE, help="Include the spatial position smoother as an additional term [default %default]"),
   make_option(c("-n", "--n_chains"), action="store", type='integer',

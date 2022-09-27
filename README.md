@@ -12,6 +12,14 @@ James Ounsley, Nora N. Hanson, Gordon W. Smith, Jonathan P. Gillson and Stuart J
 
 In prep.
 
+## Dependencies
+
+R libraries:
+  - optparse
+  - tidyverse
+  - rstan
+  - bayesplot
+
 ## Setup
 
 1. TODO: Data - how are we providing this to the user?
