@@ -1,6 +1,6 @@
 # Bayesian Heirarchical stock recruitment model for Scottish salmon stocks
 
-This model pools salmon egg-to-egg stock recruitment data for 10 Scottish stocks and 1 English stock
+This model pools salmon egg-to-egg stock recruitment data for 11 Scottish stocks and 1 English stock
 to allow the transportation of biological reference points (e.g. spawning stock at maximum sustainable yield)
 to non-monitored stocks. Informative explanatory covariates are identified through cross-validation.
 
@@ -15,6 +15,7 @@ In prep.
 ## Dependencies
 
 R libraries:
+
   - optparse
   - tidyverse
   - rstan
@@ -24,6 +25,7 @@ R libraries:
 
 1. TODO: Data - how are we providing this to the user?
 2. Run through scripts in sequence. 
+
     + 01_wrangle_data.R - wrangles the raw data from use by the models.
     + 02_run_model.R - runs a model with specified covariates. Easiest to
      run from the command line using Rscript.exe passing in arguments through 
