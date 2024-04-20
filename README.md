@@ -23,7 +23,7 @@ R libraries:
 
 ## Setup
 
-1. TODO: Data - how are we providing this to the user?
+1. Data available on request from James Ounsley <james.ounsley@gov.scot>
 2. Run through scripts in sequence. 
 
     + 01_wrangle_data.R - wrangles the raw data from use by the models.
