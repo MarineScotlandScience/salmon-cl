@@ -1,159 +1,187 @@
 
 library(dplyr)
+library(ggplot2)
+library(stringr)
 
 OMIT_K_DEE <- FALSE
 
 CV_PATH <- 'results/'
 N_FOLDS <- 12
 if(OMIT_K_DEE){
- CV_PATH <- 'results/omit_k_dee/'
- N_FOLDS <- 11
+  CV_PATH <- 'results/omit_k_dee/'
+  N_FOLDS <- 11
 }
 
-cv_file_list <- list.files(path = CV_PATH,pattern = "cv.*\\.rds",
-                           full.names = TRUE)
+# Functions ####
+log_mean_exp <- function(x){log(mean(exp(x)))}
+
+get_spatial_type <- function(x,y){
+  if(y) return("SP")
+  if(str_detect(x,'coast_lat')) return("Coast + Lat")
+  if(str_detect(x,'coast')) return("Coast")
+  if(str_detect(x,'lat')) return("Lat")
+  if(str_detect(x,'lsp')) return("log(SP)")
+  return("None")
+}
+
+
+cv_file_list <- list.files(path = CV_PATH,pattern = "cv.*\\.rds",full.names = TRUE)
 
 cv_list <- list()
-lpd_mat <- list()
-lpd_by_river_mat <- list()
+loo_list <- list()
 for(f in cv_file_list){
   
   print(paste("Loading cv results",f))
   cv_results <- readRDS(f)
+  full_results <- readRDS(stringr::str_replace(f,"cv_","fit_"))
   cv_results$folds <- cv_results$folds[order(names(cv_results$folds))]
   if(length(cv_results$folds)<N_FOLDS){
     print(paste("cv results",f,"incomplete...skipping"))
     next()
   }
   
+  lppds <- list()
   
-  lpd_list <- list()
-  lpd_by_river_list <- list()
   # Iterate over folds
   for(r in names(cv_results$folds)){
     # Get the fit for this fold
+    # S X N (held out) log likelihoods
     cv_fit <- as.data.frame(cv_results$folds[[r]])
     
-    # Calculate the lpd for each point
-    lpd_list[[r]] <- log(colMeans(exp(as.matrix(cv_fit))))
-    
-    # Calculate the lpd for all data as a "single data point"
-    lpd_by_river_list[[r]] <- log(mean(exp(as.matrix(cv_fit))))
+    # Joint log posterior predictive densities
+    # Sum over all predictive values for this group
+    # lppds (S samples for this river)
+    lppds[[r]] <- rowSums(cv_fit)
   }
   
-  # Pointwise lpd
-  # Weight data points equally in cv
-  lpd <- unlist(lpd_list)
-  lpd_mat[[f]] <- lpd
-  logo_cv = sum(unlist(lpd))
-  logo_cv_se = sqrt(length(lpd)) * sd(lpd)
+  # lppds from brms method
+  # S x G df
+  lppds <- do.call(cbind,lppds)
+  # Expected log predictive densities
+  # (average over samples)
+  elpds <- apply(lppds,2,log_mean_exp)
   
-  # River wise lpd 
-  # Weight rivers equally in cv
-  lpd_by_river <- unlist(lpd_by_river_list)
-  lpd_by_river_mat[[f]] <- lpd_by_river
-  logo_cv_2 = sum(lpd_by_river)
-  logo_cv_2_se = sqrt(length(lpd_by_river)) * sd(lpd_by_river)
+  # compute effective number of parameters
+  # (requires deriving likelihood for model fit on all data)
+  log_lik <- rstan::extract(full_results$stan_fit,'log_lik')[[1]]
+  ll_full_marg <- matrix(nrow = nrow(log_lik), ncol = length(names(cv_results$folds)))
+  
+  # Derive joint log likelihood over rivers
+  for(r_idx in 1:N_FOLDS){
+    fold_idx = full_results$model_data$river == r_idx
+    ll_full_marg[,r_idx] <- rowSums(log_lik[,fold_idx,drop=FALSE])
+  }
+  # Average over samples
+  lpds <- apply(ll_full_marg, 2, log_mean_exp)
+  # Estimated number of parameters
+  ps <- lpds - elpds
+  
+  # Construct a loo object manually
+  make_loo <- function(elpds,ps){
+    pointwise <- cbind(elpd_kfold = elpds, p_kfold = ps, kfoldic = -2 * elpds)
+    est <- colSums(pointwise)
+    se_est <- sqrt(nrow(pointwise) * apply(pointwise, 2, var))
+    estimates <- cbind(Estimate = est, SE = se_est)
+    
+    rownames(estimates) <- colnames(pointwise)
+    out <- list(estimates=estimates, pointwise=pointwise)
+    out <- structure(out, class = c("kfold", "loo"))
+  }
+  
+  loo_list[[f]] <- make_loo(elpds,ps)
   
   cv_list[[f]] <- data.frame(filename=f,
                              model=cv_results$model,
                              covariates=stringr::str_c(cv_results$covariates,collapse='_'),
-                             sp=cv_results$sp,
-                             logo_cv,
-                             logo_cv_se,
-                             logo_cv_2,
-                             logo_cv_2_se)
+                             sp=cv_results$sp)
   
   
 }
 
 
-elpd_diff_function <- function(elpd_mat){
-
-  # Which is the best model  
-  max_elpd <- which(apply(elpd_mat,1,sum) == max(apply(elpd_mat,1,sum)))
-  # Calculate diff relative to best model
-  elpd_diff <- apply(t(elpd_mat) - elpd_mat[max_elpd,],2,sum)
-  # Calculate sd of difference relative to best model
-  elpd_diff_se <- sqrt(ncol(elpd_mat))*apply(t(elpd_mat) - elpd_mat[max_elpd,],2,sd)
-  
-  return(data.frame(elpd_diff,elpd_diff_se))
-}
-
-# Calculate difference on all models
-lpd_mat <- as.matrix(bind_rows(lpd_mat))
-lpd_by_river_mat <- as.matrix(bind_rows(lpd_by_river_mat))
-
-elpd_diff <- elpd_diff_function(lpd_mat)
-elpd_by_river_diff <- elpd_diff_function(lpd_by_river_mat)
-names(elpd_by_river_diff) <- paste0(names(elpd_by_river_diff),"_by_river")
 
 
-spatial_names <- c('None','SP','Lat','Coast + Lat') 
-
-cv_summary <- dplyr::bind_rows(cv_list) %>% 
-  bind_cols(elpd_diff,elpd_by_river_diff) %>% 
-  arrange(desc(elpd_diff_by_river)) %>% 
-  mutate(spatial_type = replace(sp,str_detect(covariates,'lat'),2),
-         spatial_type = spatial_names[spatial_type+1]) %>% 
-  mutate(covariates = str_replace(covariates,"_lat_*",""),
-         covariates = str_replace(covariates,"lat_*",""))
-
-cv_summary
-
-
-saveRDS(cv_summary,file = paste0(CV_PATH,'cross_validation_summary.rds'))
-
-# Plot by river comparison with standard error
-cv_table <- cv_summary %>% 
-  mutate(covariates = gsub('_',', ', covariates),
-         covariates = sub('lat','Lat',covariates),
+# Sanitise model detailes table and add comparison
+cv_table <- dplyr::bind_rows(cv_list) %>% 
+  rowwise() |>
+  mutate(spatial_type = get_spatial_type(covariates,sp)) |>
+  ungroup() |>
+  mutate(covariates = stringr::str_replace(covariates,"_lat_*","_"),
+         covariates = stringr::str_replace(covariates,"lat_*",""),
+         covariates = stringr::str_replace(covariates,"coast_*",""),
+         covariates = stringr::str_replace(covariates,"lsp_*",""),
+         covariates = gsub('_',', ', covariates),
          covariates = sub('lcpa','CPA',covariates), 
-         covariates = sub('coast','Coast',covariates), 
          covariates = sub('sf','CT',covariates), 
          covariates = sub('pc1','LU',covariates),
-         covariates = replace(covariates,is.na(covariates),'')) %>% 
-  filter(!grepl('Coast \\+ Lat',spatial_type)) %>% 
-  mutate(rank_2 = nrow(.) - rank(elpd_diff_by_river) + 1) %>%  
-  mutate(covariates = fct_inorder(covariates)) %>% 
-  mutate(elpd_diff_min = elpd_diff - elpd_diff_se,
-         elpd_diff_max = elpd_diff + elpd_diff_se) %>% 
-  mutate(elpd_diff_2_min = elpd_diff_by_river - elpd_diff_se_by_river,
-         elpd_diff_2_max = elpd_diff_by_river + elpd_diff_se_by_river) %>% 
-  arrange(-1*elpd_diff_by_river) %>% 
-  mutate(covariates = fct_inorder(covariates))
+         covariates = replace(covariates,is.na(covariates),''))  
 
-# Plot river level cv score 
-pl2 <- ggplot(cv_table,
-              aes(covariates,elpd_diff_by_river,
-                  ymin = elpd_diff_2_min,
-                  ymax = elpd_diff_2_max,
-                  col=spatial_type,
-                  shape=spatial_type)) +
-  geom_point(size=2,position = position_dodge(0.5)) + 
-  geom_errorbar(position = position_dodge(0.5),width=0.5,size=.7) +
-  scale_color_brewer(palette = 'Set2') + 
-  scale_color_discrete(name='Spatial structure') + 
-  scale_shape_discrete(name='Spatial structure') +
-  labs(x='Among-stock explanatory variables',
-       y=expression(Delta*elpd_[CV*"*"])) +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+#### Yates paper approach
+#
+# Yates, Luke A., Zach Aandahl, Shane A. Richards, and Barry W. Brook. 2023. 
+# “Cross Validation for Model Selection: A Review with Examples from Ecology.” 
+# Ecological Monographs 93(1): e1557. https://doi. org/10.1002/ecm.1557
 
-pl2
+cv_plot <- function(logo_df){
+  spatial_levels <-  c('Coast + Lat','Coast','None','Lat','SP','log(SP)')
+  covariate_levels <- c('CT', 'LU, CT','CPA, CT','CPA, LU, CT')
+  
+  logo_df <- logo_df |> mutate(spatial_type = factor(spatial_type,levels = spatial_levels),
+                               covariates = factor(covariates,levels=covariate_levels)) |>
+    mutate(ose_model = ifelse(metric + se >= max(metric),1,0))
+  
+  
+  logo_df |> mutate(spatial_type = factor(spatial_type,levels = spatial_levels),
+                    covariates = factor(covariates,levels=covariate_levels))|>
+    ggplot(aes(x = covariates)) +
+    geom_point(aes(y=metric,size=ose_model),col='black', shape = 1, show.legend = F) +
+    geom_point(aes(y = metric, col = spatial_type), size = 2, show.legend = F) +
+    geom_linerange(aes(ymin = metric - se, ymax = metric + se, col = spatial_type), show.legend = F) +
+    theme_classic() +
+    theme(strip.placement = "outside", panel.border = element_blank(), 
+          strip.background = element_rect(), axis.ticks.x = element_blank(),
+          strip.text = element_text(size = 8), strip.background.x = element_rect(linetype = 0, fill = "grey90"),
+          axis.title.y = element_text(size = 8),axis.text.x = element_text(angle = 90, hjust = 1)) +
+    facet_wrap(~spatial_type,nrow = 1, strip.position = "top") +
+    scale_color_brewer(type = "div", palette = "Dark2") + 
+    scale_size(range=c(0,4)) +
+    labs(y=expression(hat(S)[CV]),x=NULL)
+}
 
-# ggplot(cv_table,
-#        aes(covariates,elpd_diff,
-#            ymin = elpd_diff_min,
-#            ymax = elpd_diff_max,  
-#            col=spatial_type,
-#            shape=spatial_type)) +
-#   geom_point(size=2,position = position_dodge(0.5)) + 
-#   geom_errorbar(position = position_dodge(0.5),width=0.5,size=.7) +
-#   scale_color_brewer(palette = 'Set2') + 
-#   scale_color_discrete(name='Spatial structure') + 
-#   scale_shape_discrete(name='Spatial structure') +
-#   labs(x='Among-stock explanatory variables',
-#        y=expression(Delta*elpd_[CV*"*"])) +
-#   theme(axis.text.x = element_text(angle = 90, hjust = 1))
+make_plot_data <- function(metric_data, levels = names(metric_data)){
+  best_model <- metric_data %>% purrr::map_dbl(mean) %>% which.max() %>% names()
+  tibble(model = factor(names(metric_data), levels = levels), 
+         metric = metric_data %>% purrr::map_dbl(mean),
+         metric_diff = metric - max(metric),
+         se = metric_data %>% purrr::map_dbl(~ .x %>% {sd(.)/sqrt(length(.))}),
+         se_diff = metric_data %>% purrr::map(~ .x - metric_data[[best_model]]) %>% purrr::map_dbl(~ .x %>% {sd(.)/sqrt(length(.))}),
+         se_mod = sqrt(1 -cor(metric_data)[best_model,])*se[best_model]) 
+}
+
+add_cv_details <- function(x,cv_table){ 
+  x |> mutate(covariates = factor(cv_table$covariates),
+              spatial_type = cv_table$spatial_type,
+              filename = cv_table$filename,
+              se_ose = se,
+              se = se_mod)
+}
+
+# Pointwise (stock wise) elpd list to data frame
+logo_pointwise <- loo_list |> 
+  purrr::map("pointwise") |> 
+  purrr::map_dfc(~.[,"elpd_kfold"]) |>
+  relocate(all_of(cv_table$filename))
+
+# Refine candidate list
+#
+# Remove models with coast 
+# Enforce catchment type
+ct_only_no_coast_cv_table <- cv_table |> filter(str_detect(covariates,"CT")) |> filter(!str_detect(spatial_type,"Coast"))
+logo_pointwise |> select(ct_only_no_coast_cv_table$filename) |> make_plot_data() |>  add_cv_details(ct_only_no_coast_cv_table) |> cv_plot()
+
+# Save plot
+if(!dir.exists('paper')) dir.create('paper')
+ggsave('paper/model_select.png',width=4,height=4)
+
 
 

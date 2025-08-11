@@ -1,27 +1,52 @@
-# Construct summary tibbles for in sample and out of
-# sample sites, including hypothetical sites for
-# positions around the coast
+# Construct summary plots and statistics using best model from 
+# cross validation
 
-## CONFIG ####
+# for in sample and out of
+# sample sites
+
+# Libraries and config ----------------------------------------------------
 rm(list = ls())
+library(rgdal)
+library(tmap)
 library(tidyverse)
-theme_set(ggpubr::theme_pubclean())
+theme_set(tidybayes::theme_tidybayes())
 
 source('R/utilities.R')
+source('config.R')
 
-## LOAD ####
-# Load the model
-results <- readRDS('results/fit_sf_sp.rds')
+# Functions ---------------------------------------------------------------
+
+to_brp_tbl <- function(x,S_mat,h_mat){
+  R_mat <- S_mat/(1-h_mat)
+  rr_mat <- R_mat/S_mat
+  
+  x |> bind_cols(to_quantiles_df(S_mat,'S'),
+                 to_quantiles_df(h_mat,'h'),
+                 to_quantiles_df(R_mat,'R'),
+                 to_quantiles_df(rr_mat,'rr'))
+}
+
+site_fix <- function(data){
+  data %>% 
+    mutate(site = gsub(pattern = "River ",replacement = "",site),
+           site = gsub(pattern = "SAC",replacement = "",site),
+           site = replace(site,site == "Dee (Kirkcudbrightshire)","K. Dee"))
+}
 
 # Load data and models ----------------------------------------------------
 
+## Stock data ----
 # Original data used to fit the model
-sr_data <- readRDS('data/model_data.rds')
-
+sr_data <- readRDS('data/modelling/model_data.rds')
 # Data for all rivers in assessment
-all_river_data = readRDS('./data/covariate_data.rds')
+# 173 areas
+all_river_data = readRDS('./data/modelling/covariate_data.rds') |> filter(!is.na(land.cover.pc1))
 
-num_basis = results$model_data$num_basis
+
+
+## Models ----
+# Best model from cv
+results <- readRDS('results/fit_lat_sf pc1 lcpa.rds')
 stan_fit_df = as.data.frame(results$stan_fit)
 
 # Extract posterior samples for parameters
@@ -40,188 +65,68 @@ sigma   <- stan_fit_df %>% select(sigma)
 
 # Construct predictions ---------------------------------------------------
 
-# FUNCTIONS
+## Prediction data for hypothetical rivers ----
 
-# Predict S using global samples and specified
-# data X,Y
-predict_S <- function(X,Y,linpred=FALSE){
-  N <- nrow(X)
-  
-  sigma_S_pred <- t(matrix(rep(as.matrix(sigma_S),N),ncol = N))
-  
-  S_pred <- X %*% t(alpha_S) + Y %*% t(beta_S)
-  #S_pred <- X %*% t(alpha_S) 
-  
-  # If we just want linear predictor
-  if(linpred) return(exp(S_pred))
-  
-  S_pred <- rnorm(length(S_pred),S_pred,sigma_S_pred)
-  S_pred <- matrix(exp(S_pred),nrow = N)
-}
+pred_data <- bind_rows(
+  data.frame(lat=seq(min(all_river_data$lat),max(all_river_data$lat),length.out=100),
+             cpa = 1,round.coast=0,land.cover.pc1=0,coast='e',spring_fish='n') |> mutate(site=paste0('pred_lat_',lat)),
+  data.frame(cpa=seq(min(all_river_data$cpa),max(all_river_data$cpa),length.out=100),
+             lat = 55,round.coast=0,land.cover.pc1=0,coast='e',spring_fish='n') |> mutate(site=paste0('pred_cpa_',cpa)),
+  data.frame(land.cover.pc1=seq(min(all_river_data$land.cover.pc1),max(all_river_data$land.cover.pc1),length.out=100),
+             lat = 55,round.coast=0,cpa=1,coast='e',spring_fish='n') |> mutate(site=paste0('pred_pc1_',land.cover.pc1))
+)
 
-# Predict H using global samples and specified
-# data X,Y
-predict_H <- function(X,Y,linpred=FALSE){
-  N <- nrow(X)
-  
-  sigma_H_pred <- t(matrix(rep(as.matrix(sigma_H),N),ncol = N))
-  
-  H_pred <- X %*% t(alpha_H) + Y %*% t(beta_H)
-  #H_pred <- X %*% t(alpha_H) 
-  
-  # If we just want linear predictor
-  if(linpred) return(InvLogit(H_pred))
-    
-  H_pred <- rnorm(length(H_pred),H_pred,sigma_H_pred)
-  H_pred <- matrix(InvLogit(H_pred),nrow = N)
-}
-
-# Calculate posterior predictions of R
-# given S_star,h_star and predicted S
-predict_ricker = function(S_star,h_star,S,linpred=FALSE){
-  
-  S <- matrix(S,ncol = 1)
-  N <- nrow(S)
-  i <- matrix(rep(1,N),ncol=1)
-  
-  sigma_pred <- t(matrix(rep(as.matrix(sigma),N),ncol = N))
-  
-  # mu = S/(1-h_star) * exp(h_star*(1-S/S_star))
-  # R ~ lognormal(log(mu),sigma)
-  tmp_1 <- S %*% (1/(1-h_star))
-  tmp_2 <- (1-S %*% (1/S_star))
-  mu <- tmp_1 * exp(i%*%h_star * tmp_2)
-  
-  if(linpred) mu
-  
-  R <- rlnorm(length(mu),log(mu),sigma_pred)
-  R <- matrix(R,nrow = N)
-  
-  return(R)
-}
-
-# Samples to quantiles
-to_quantiles_df <- function(X,var_name='S',...){
-  X_quants <- t(apply(X,1,quantile,probs=c(0.05,0.1,0.25,0.5,0.75,0.9,0.95),...))
-  colnames(X_quants) <- paste(var_name,c('q05','q10','q25','q50','q75','q90','q95'),sep='_')
-  return(as_tibble(X_quants))
-  
-}
-
-# Bayesian R2
-# See R-squared for Bayesian regression models
-# Gelman et al. 2018
-
-# Using fitted variance parameter for residual variance
-bayes_R2 <- function(pred,sigma,y) {
-  var_fit <- apply(pred, 1, var)
-  var_res <- sigma^2
-  r2 <- var_fit / (var_fit + var_res)
-  colnames(r2) <- "R2"
-  r2
-}
-
-
-# Using residuals for residual variance
-bayes_R2_2 <- function(y_hat,y) {
-  var_fit <- apply(y_hat, 2, var)
-  e <- -1*sweep(y_hat,1,y)
-  var_e <- apply(e,2,var)
-  r2 <- var_fit / (var_fit + var_e)
-  r2 <- data.frame(R2 = r2)
-  r2
-}
-
-# Prediction data for hypothetical rivers
-unscaled_range = range(all_river_data$round.coast,sr_data$round.coast)
-unscaled_lat = range(all_river_data$lat,sr_data$lat)
-
-# Values of SP which are closest to 55 degree on both coasts
-# for comparison with previous analyses
-fifty_five <- c(1.264,7.74)
-
-P <- 52
-pred_rc <- c(seq(unscaled_range[1],
-                 unscaled_range[2],
-                 length.out = P-2),fifty_five)
-pred_lat <- seq(unscaled_lat[1],unscaled_lat[2],length.out=P-2)
-
-pred_data <- tibble(round.coast = rep(pred_rc,2),
-                    lat = 0,
-                    coast = factor('e',levels=c('e','w')),
-                    spring_fish = factor(rep(c('n','y'),each=P)),
-                    land.cover.pc1=0,
-                    cpa=rep(c(1,2),each=P)) %>% 
-  mutate(site = paste0('site_',row_number())) %>% 
-  arrange(site)
-
-
-
-# Posterior predictions, hypothetical new rivers ------------------------
+#pred_data <- pred_data |> bind_rows(pred_data |> mutate(spring_fish = 'y',site=paste0(site,'_sf')))
 
 # Construct design matrices for linear covariates and P-splines
-X_pred <- create_model_matrix(pred_data,covariates = results$covariates)
-X_pred[,'pc1'] <- 0
-X_pred[,'lat'] <- 0
+X_pred <- create_new_model_matrix(old_data = sr_data,
+                                  new_data = pred_data,
+                                  covariates = results$covariates)
+row.names(X_pred) <- pred_data$site
+X_pred_sf <- X_pred
+X_pred_sf[,'sf'] <- 1
+row.names(X_pred_sf) <- paste0(pred_data$site,'_sf')
 
-Y_pred <- create_coast_spline_matrix(pred_data$round.coast,s_range=unscaled_range,num_basis)
+X_pred <- rbind(X_pred,X_pred_sf)
 
-S_pred <- predict_S(X_pred,Y_pred)
-H_pred <- predict_H(X_pred,Y_pred)
+X_pred[!grepl('pred_cpa',rownames(X_pred)),'lcpa'] <- 0
+X_pred[!grepl('pred_lat',rownames(X_pred)),'lat'] <- 0
+X_pred[!grepl('pred_pc1',rownames(X_pred)),'pc1'] <- 0
 
-S_quants <- to_quantiles_df(S_pred,'S')
-H_quants <- to_quantiles_df(H_pred,'H')
+S_pred <- predict_S(X_pred, alpha_S = alpha_S ,sigma_S = sigma_S)
+H_pred <- predict_H(X_pred, alpha_H = alpha_H ,sigma_H = sigma_H)
+
+pred_site_tbl <- as_tibble(X_pred,rownames = 'site') |> to_brp_tbl(S_pred,H_pred) |> mutate(sf=factor(sf))
+
+## S* predictions ####
+s_plot <- function(x,var,xlab=""){
+  x |> 
+    ggplot(aes(x={{var}},y=S_q50,ymin=S_q05,ymax=S_q95)) + 
+    geom_ribbon(aes(fill=sf),alpha=0.1) +
+    geom_line(aes(col=sf)) +
+    labs(y="S* eggs/m^2",x=xlab) + 
+    scale_y_log10(limits=c(0.1,50)) 
+  
+}
+
+ggpubr::ggarrange(pred_site_tbl %>% filter(grepl('pred_cpa',site)) |> 
+                    mutate(lcpa = sd(unique(log(sr_data$cpa)))*lcpa + mean(unique(log(sr_data$cpa)))) |> 
+                    s_plot(lcpa,"CPA"),
+                  pred_site_tbl |> filter(grepl('pred_lat',site)) |> 
+                    mutate(lat = sd(unique(sr_data$lat))*lat + mean(unique(sr_data$lat))) |> 
+                    s_plot(lat,"Lat"),
+                  pred_site_tbl |> filter(grepl('pred_pc1',site)) |> 
+                    mutate(pc1 = sd(unique(sr_data$land.cover.pc1))*pc1 + mean(unique(sr_data$land.cover.pc1))) |> 
+                    s_plot(pc1,"LU"),
+                  nrow=1,common.legend = TRUE)
 
 
-# Bayesian R2 -------------------------------------------------------------
-# Linear predictors required for bayesian R squared values on 
-# derived parameters
-
-# R2 values
-# A few issues with R2 values
-# 1. R2 values for S* are slightly weird, as the S* values themselves are 
-#   parameter estiamtes with uncertainty. S* (or h*) are not dependent variables 
-#   that have been measured.
-# 2. R2 values are slightly problematic for Bayesian models, as it is possible 
-#   (with strong prior information) to have an R2 greater than 1, using the 
-#   classic definition.
-# 3. There exisits a 'Bayesian R2' value which can be calculated, but this does 
-#   not have the same interpretation as 'proportion variance explained'. It is 
-#   given as ratio of variance in predictive values, to the variance of 
-#   predictive value plus the variance of the residuals. This is conditional on 
-#   the model and hence cannot always be used to show improvement for model fits.
-
-S_pp <- predict_S(results$model_data$X,results$model_data$Y,linpred = TRUE)
-H_pp <- predict_H(results$model_data$X,results$model_data$Y,linpred = TRUE)
-
-R2_S <- bayes_R2(S_pp,sigma_S)
-R2_h <- bayes_R2(H_pp,sigma_H)
-
-# PLot and summarise
-R2_S %>% ggplot(aes(x=R2)) + geom_histogram()
-R2_h %>% ggplot(aes(x=R2)) + geom_histogram()
-summary(R2_S)
-summary(R2_h)
-
-# Posterior predictions actual new rivers -------------------------------
-X_all_rivers <- create_model_matrix(all_river_data,results$covariates)
-Y_all_rivers <- create_coast_spline_matrix(all_river_data$round.coast,
-                                           num_basis = num_basis,
-                                           s_range = unscaled_range)
-S_all_rivers <- predict_S(X_all_rivers,Y_all_rivers)
-H_all_rivers <- predict_H(X_all_rivers,Y_all_rivers)
-
-S_quants_all_rivers <- to_quantiles_df(S_all_rivers,'S',na.rm=TRUE)
-H_quants_all_rivers <- to_quantiles_df(H_all_rivers,'H',na.rm=TRUE)
-
-# Posterior predictions for fit sites -----------------------------------
-S_star_quants <- to_quantiles_df(t(S_star),'S')
-H_star_quants <- to_quantiles_df(t(H_star),'H')
+## Posterior predictions for fit sites -----------------------------------
 
 # SR predictions for fit sites
 pred_sr <- sr_data %>% group_by(site) %>% 
   summarise(S_max = max(S),
-            S_pred = seq(0,S_max,length.out = P)) %>% 
+            S_pred = seq(0,S_max,length.out = 100)) %>% 
   ungroup()
 
 
@@ -241,107 +146,243 @@ for(i in 1:nlevels(pred_sr$site)){
 }
 summary_sr_data <- bind_rows(summary_sr_data)
 
-R2_all <- bayes_R2_2(y_hat,sr_data$R)
-R2_all %>% ggplot(aes(x=R2)) + geom_histogram()
+fit_site_tbl <- as_tibble(results$model_data$X,rownames="site") %>% 
+  left_join(sr_data |> group_by(site) |> 
+              summarise(round.coast=first(round.coast),riverSalmon=first(area),cpa=first(cpa))) |>
+  to_brp_tbl(t(S_star),t(H_star)) 
 
-resid <- sweep(log(y_hat),1,log(sr_data$R))
-resid_tbl <- to_quantiles_df(resid,var_name = 'resid') %>% 
-  mutate(y = 1:n(),
-         site = sr_data$site,
-         R = sr_data$R)
-resid_tbl %>% ggplot(aes(x=R,y=resid_q50,ymin=resid_q05,ymax=resid_q95,col=site)) + 
-  geom_errorbar(stat = 'identity',alpha=0.3) + geom_point()
+## Posterior predictions actual new rivers -------------------------------
+X_all_rivers <- create_new_model_matrix(old_data = sr_data,
+                                        new_data = all_river_data,
+                                        covariates = results$covariates)
 
-resid_tbl %>% ggplot(aes(x=R,y=resid_q50,col=site)) + 
-   geom_point()
+S_all_rivers <- predict_S(X_all_rivers, alpha_S = alpha_S ,sigma_S = sigma_S)
+H_all_rivers <- predict_H(X_all_rivers, alpha_H = alpha_H ,sigma_H = sigma_H)
 
-resid_tbl %>% ggplot(aes(sample=resid_q50,col=site)) + 
-  stat_qq() + stat_qq_line()
-
-
-
-# CONSOLIDATE 
-
-pred_data <- pred_data %>% 
-  bind_cols(S_quants) %>% 
-  bind_cols(H_quants) %>% 
-  mutate(spring_fish = factor(spring_fish))
-
-all_river_data <- all_river_data %>% 
-  select(site,lat,coast,cpa,spring_fish,round.coast) %>% 
-  bind_cols(S_quants_all_rivers) %>% 
-  bind_cols(H_quants_all_rivers)
-
-fit_rivers <- sr_data %>% 
-  group_by(site) %>% 
-  summarise_all(first) %>% 
-  select(site,lat,coast,cpa,spring_fish,round.coast) %>% 
-  bind_cols(S_star_quants) %>% 
-  bind_cols(H_star_quants) %>% 
-  ungroup()
-
-all_river_data <- all_river_data %>% 
-  filter(!(site %in% fit_rivers$site)) 
-
-summary_data <- bind_rows(new_site = all_river_data,
-                          fit_site = fit_rivers,
-                          pred_site = pred_data,.id='prediction_type')
-
-# SAVE 
-saveRDS(summary_data,'data/final_model_predictions_summary.rds')
-saveRDS(summary_sr_data,'data/final_model_predictions_sr_summary.rds')
-
-# Plots -------------------------------------------------------------------
+new_site_tbl <- as_tibble(X_all_rivers,rownames = 'site') |> 
+  left_join(all_river_data |> mutate(site=river) |> select(site,round.coast,riverSalmon,cpa)) |>
+  to_brp_tbl(S_all_rivers,H_all_rivers) |> 
+  filter(!(site %in% fit_site_tbl$site)) 
 
 
-## Plots to check ####
-summary_data %>% filter(prediction_type=='pred_site') %>% 
-  ggplot(aes(x=round.coast,ymin=S_q05,ymax=S_q95,y=S_q50,fill=spring_fish)) + 
-  geom_ribbon(alpha=0.1) +
-  geom_line(aes(col=spring_fish)) + 
-  geom_errorbar(data=summary_data %>% filter(prediction_type=='fit_site'),
-                aes(col=spring_fish)) +
-  geom_point(data=summary_data %>% filter(prediction_type=='fit_site'),
-             aes(col=spring_fish)) +
-  scale_y_log10()
+# Plot 1. Ricker fits and prediction intervals ----
 
-summary_data %>% filter(prediction_type=='pred_site') %>% 
-  ggplot(aes(x=round.coast,ymin=H_q05,ymax=H_q95,y=H_q50,fill=spring_fish)) + 
-  geom_ribbon(alpha=0.1) +
-  geom_line(aes(col=spring_fish)) + 
-  geom_errorbar(data=summary_data %>% filter(prediction_type=='fit_site'),
-                aes(col=spring_fish)) +
-  geom_point(data=summary_data %>% filter(prediction_type=='fit_site'),
-             aes(col=spring_fish)) 
+S_star_median <- fit_site_tbl %>% mutate(S_star = S_q50) %>% select(site,S_star) %>% 
+  site_fix()
 
-summary_data %>% 
-  filter(prediction_type %in% c('fit_site','new_site'),
-         spring_fish=='n',
-         site!='River Lune') %>% 
-  arrange(round.coast) %>% 
-  mutate(site = fct_reorder(site,round.coast)) %>% 
-  ggplot(aes(x=site,ymin=S_q05,lower=S_q25,middle=S_q50,
-             upper=S_q75,ymax=S_q95))+
-  geom_boxplot(stat = 'identity')
-
-
-summary_sr_data %>% 
+summary_sr_data %>% site_fix() |>
   ggplot(aes(x=S_pred,y=R_q50,ymin=R_q05,ymax=R_q95)) + 
   geom_ribbon(alpha=0.2) + 
-  geom_line() + 
-  geom_vline(data = summary_data %>% filter(prediction_type=='fit_site'),aes(xintercept=S_q50))+
-  geom_point(data = sr_data,aes(x=S,y=R),inherit.aes = FALSE) +
-  facet_wrap(~site, scales = 'free')
+  geom_line(size=.8) + 
+  geom_abline(slope = 1,size=0.2,linetype=2) +
+  geom_point(data = sr_data %>% site_fix(),aes(x=S,y=R),inherit.aes = FALSE) +
+  geom_vline(data = S_star_median,aes(xintercept = S_star),size=.8,linetype=2) +
+  facet_wrap(~site, scales = 'free') + 
+  labs(y=expression(paste("Recruitment (eggs/",m^2,")")),
+       x=expression(paste('Spawing stock (eggs/',m^2,")"))) 
+ggsave('paper/ricker_fit.png',width=8,height=6)
 
+
+# Plot 2. S* assessment areas ####
+
+all_sites <- bind_rows(new_site = new_site_tbl,
+                       fit_site = fit_site_tbl,.id='prediction_type') |>
+  mutate(site=factor(site),sf=factor(sf))
+
+all_sites %>% 
+  filter(prediction_type %in% c('fit_site','new_site'),
+         sf=='0',
+         site!='River Lune') %>% site_fix() |>
+  mutate(site = fct_reorder(site,S_q50)) %>% 
+  ggplot(aes(x=site,y=S_q50,ymin=S_q05,ymax=S_q95,col=prediction_type))+
+  geom_linerange() + 
+  geom_linerange(aes(ymin=S_q25,ymax=S_q75),size=1) + 
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y=NULL) + 
+  scale_y_log10()
+
+# Plot 3. HP Fit vs predictions ----
+
+# Out of sample predictions for all rivers in cv process
+
+fit_dir <- 'results/cv_lat_sf pc1 lcpa_fits/'
+fit_fnames <- list.files(fit_dir)
+mu_new_list <- list()
+hp_new_list <- list()
+for(fname in fit_fnames){
+  fit <- readRDS(paste0(fit_dir,fname))
+  r <- str_remove(fname,'.rds')
+  mu_new_list[[r]] <- fit |> tidybayes::tidy_draws() |> tidybayes::spread_draws(mu_new[n],sigma,S_star_new,h_star_new) 
+  hp_new_list[[r]] <- fit |> tidybayes::spread_draws(S_star_new,h_star_new) |> 
+    mutate(rr_star_new = 1/(1-h_star_new)) |> 
+    tidybayes::gather_draws(S_star_new,h_star_new,rr_star_new)
+}
+
+
+hp_samples <- bind_rows(hp_new_list,.id='site') |>  
+  bind_rows(results$stan_fit |> tidybayes::tidy_draws() |> 
+              tidybayes::spread_draws(S_star[site],h_star[site]) |>
+              mutate(rr_star = 1/(1-h_star)) |>
+              tidybayes::unspread_draws(S_star[site],h_star[site],rr_star[site]) |>
+              tidybayes::gather_draws(S_star[site],h_star[site],rr_star[site]) |> 
+              mutate(site=names(hp_new_list)[site])
+  )
+
+plt_data <-  hp_samples |>
+  group_by(site,.variable) |>
+  #mutate(.value = ifelse(grepl('S_star',.variable),log(.value),.value)) |>
+  tidybayes::median_qi(.width = c(.5,.9)) |>
+  tidyr::separate_wider_delim(.variable,delim = "_",names = c('param','temp','type'),too_few = 'align_start') |>
+  tidyr::replace_na(list(type='Fit')) |>
+  left_join(fit_site_tbl |> select(site,lat)) |>
+  site_fix() |>
+  mutate(param=paste0(param,'*'),
+         type=replace(type,type=="new","Prediction")) |>
+  mutate(site = forcats::fct_reorder(site,lat))
+
+
+ggpubr::ggarrange(plt_data |> filter(param=="S*") |>
+                    ggplot(aes(x=site,y=.value)) + 
+                    labs(x=NULL) +tidybayes::geom_pointinterval(aes(ymin = .lower, ymax = .upper,col=type),position=position_dodge(0.6)) + 
+                    #facet_wrap(~param) +
+                    labs(col='',y=expression(S*"* (eggs/"*m^2*")"))+
+                    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+                    scale_y_log10(),
+                  plt_data |> filter(param=="h*") |>
+                    ggplot(aes(x=site,y=.value)) + 
+                    #facet_wrap(~param) +
+                    labs(x=NULL,col='',y='h*') +
+                    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+                    tidybayes::geom_pointinterval(aes(ymin = .lower, ymax = .upper,col=type),position=position_dodge(0.6)),
+                  common.legend = TRUE,legend = "top",nrow=1)
+ggsave('paper/hyperparam_predictions.png',width=6,height=3.5,scale = 1.2)
+
+# Plot 4. Effect sizes ----
+cov_map <- list(int = 'Int',sf='CT',lat='Lat',lcpa='CPA',pc1='LU')
+
+cov_summary <- rstan::summary(results$stan_fit,pars=c("alpha_S",'alpha_h'),probs=c(0.05,.5,0.95))
+cov_summary <- as.data.frame(cov_summary$summary) %>% 
+  mutate(param = rep(colnames(results$model_data$X),2)) %>% 
+  select(param,mean,`5%`,`50%`,`95%`)
+
+cov_summary
+
+# Plot covariate coefficients
+as_tibble(cov_summary,rownames = "hyperparam") |>
+  mutate(hyperparam = str_match(hyperparam,"alpha_(S|h)")[,2]) |>
+  mutate(hyperparam = paste0(hyperparam,'*'),
+         hyperparam = factor(hyperparam,levels=c('S*','h*'))) |>
+  filter(!param %in% c('coast')) |> 
+  mutate(param = unlist(cov_map[param]),
+         param = factor(param,levels=cov_map)) |>
+  ggplot(aes(x=param,y=`50%`,ymin=`5%`,ymax=`95%`)) + 
+  geom_hline(yintercept = 0,col='grey') +
+  geom_point() + 
+  geom_linerange() + 
+  labs(y='Effect size',x=NULL) +
+  facet_wrap(~hyperparam)
+
+ggsave(filename = 'paper/effect_size.png',width = 4,height = 4)
+
+# Maps ----
+## Map data ----
+
+# Base map of Scotland for background of plot
+scotland_map <- readOGR(dsn=paste0(GIS_DATA_PATH,"pan50.shp"))
+
+# Polygons for all assessed areas
+river_shapes <- readOGR(dsn=paste0(GIS_DATA_PATH,"AR2017_Boundaries_170613.shp"))
+
+# Map a variable
+map_value <- function(x,v_name, fit_point=TRUE, fit_text = FALSE, pal='Blues',style='pretty'){
+  
+  # Update Moriston to have Ness values
+  x[x$site=="River Moriston SAC",c(v_name,"prediction_type")] <-  x[x$site == "River Ness",c(v_name,"prediction_type")]
+  
+  # Map labels
+  label_data <- sr_data |> group_by(site) |> 
+    summarise(lat = mean(lat),lon = mean(long),CT=first(spring_fish)) |> 
+    site_fix() |> 
+    arrange(site) |>
+    mutate(label = paste0("(",letters[1:12],")"),
+           CT = case_match(CT,
+                           'y'~'upper',
+                           'n'~'whole'
+           ),
+           ymod = ifelse(site%in%c("North Esk"),-1.5,0),
+           xmod = ifelse(site=="Baddoch",-1,0))
+  
+  label_sf <- sf::st_as_sf(label_data,coords = c('lon','lat'))
+  
+  v <- unlist(x[,v_name])
+  pt <- x$prediction_type
+  names(v) <- names(pt) <- x$site
+  
+  river_shapes$v <- signif(v[as.character(river_shapes$river)],2)
+  river_shapes$pt <- pt[as.character(river_shapes$river)]
+  
+  shetland_lim <- c(1060000,1220289)
+  
+  sc_map <-  tm_shape(scotland_map,ylim = c(530223,1060000)) + 
+    tm_graticules(labels.inside.frame=TRUE,n.y=5,n.x=4) +
+    tm_fill('grey80') +
+    tm_layout(frame = FALSE, outer.margins = c(0.01, 0.01, 0.01, 0.01), inner.margins = c(0, 0, 0, 0),legend.bg.color = "white") +
+    tm_shape(river_shapes) +
+    tm_fill("v",title=v_name,palette=pal,style = style) +
+    tm_borders(col='grey60')  #
+  if(fit_point){
+    sc_map <- sc_map +
+      tm_shape(label_sf) + 
+      tm_symbols(col = 'CT',size = .5,border.col='black')
+  }
+  if(fit_text){
+    sc_map <- sc_map + 
+      tm_text("site",just=c(0.5,-.5),ymod="ymod",xmod="xmod",shadow=TRUE)
+  }
+  inset_map <- tm_shape(scotland_map,
+                        ylim = c(1060000,1220289),
+                        xlim = c(380000, 470315)) + 
+    tm_graticules(labels.inside.frame=FALSE,lines=FALSE,n.y=4,n.x=2) +
+    tm_fill('grey80')
+  
+  sc_grob <- tmap_grob(sc_map)
+  inset_grob <- tmap_grob(inset_map)
+  
+  cowplot::ggdraw() +
+    cowplot::draw_plot(sc_grob,width=1,height=1) +
+    cowplot::draw_plot(inset_grob,
+                       width = 0.2, height = 0.2,
+                       x = 0.75, y = 0.725) 
+}
+
+
+## Plot 5. Covariate map ----
+
+map_data <- all_sites %>% mutate(coast_no = as.numeric(factor(coast)))
+# ar .809
+map_lcpa <- map_data |> mutate(`CPA` = cpa) |> map_value("CPA",pal='Oranges',style='log10')
+map_lu <- map_data |> mutate(LU = pc1) |> map_value("LU",pal='Oranges',style='cont')
+map_sp <- map_data |> mutate(SP = round.coast) |> map_value("SP",pal='Oranges',style='cont')
+map_wa <- map_data |> mutate(`WA (mil)` = riverSalmon/1000000) |> map_value("WA (mil)",pal='Oranges',style='log10',fit_text = TRUE)
+
+pl_save <- ggpubr::ggarrange(map_wa,map_lcpa,map_lu,map_sp,labels = c('a)','b)','c)','d)'))
+ggsave("./paper/map_model_cov.png",plot = pl_save,width=10,height=12)
+
+## Plot 6. Prediction map ----
+
+map_s <- map_data |> mutate(`S*` = S_q50) |> map_value("S*",pal='Blues',fit_point=FALSE)
+map_h <- map_data |> mutate(`h*` = h_q50) |> map_value("h*",pal='Blues',fit_point=FALSE)
+#map_rr <- map_data |> mutate("R*/S*" = rr_q50) |> plot_value("R*/S*")
+
+pl_save <- ggpubr::ggarrange(map_s,map_h,labels = c('a)','b)'),nrow = 1)
+ggsave("./paper/map_model_pred.png",plot = pl_save,width=10,height=6)
 
 # Results for ms text -----------------------------------------------------
 
-# 80 intervals for 55 degree equivalent sites
-summary_data %>% filter(round.coast %in% fifty_five, spring_fish=="n")
-
 
 # Ranges of egg targets for new sites
-summary_data %>% filter(prediction_type == 'new_site') %>% 
+new_site_tbl %>% 
   summarise(min = min(S_q50),
             max = max(S_q50),
             min_05 = min(S_q05),
@@ -349,12 +390,3 @@ summary_data %>% filter(prediction_type == 'new_site') %>%
             min_95 = min(S_q95),
             max_95 = max(S_q95))
 
-# Summary of covariates
-s <- rstan::summary(results$stan_fit,pars=c("alpha_S",'alpha_h'),probs=c(0.05,0.95))
-as.data.frame(s$summary) %>% 
-  mutate(param = rep(colnames(results$model_data$X),2)) %>% 
-  select(param,mean,`5%`,`95%`)
-
-# Bayesian R2 summaries
-summary(R2_S)
-summary(R2_h)
